@@ -1,47 +1,6 @@
-#=
-        elseif x == 0xf2
-        REPN
-    elseif x == 0xf3
-        REP
-    elseif x == 0x2e
-        CS
-    elseif x == 0x36
-        SS
-    elseif x == 0x3e
-        DS
-    elseif x == 0x26
-        ES
-    elseif x == 0x64
-        FS
-    elseif x == 0x65
-        GS
-    elseif x == 0x66
-        OP_SZO
-    elseif x == 0x67
-        AD_SZO
-    else
-        NO
-
-const NO =     0x0000000000000000
-const LOCK =   0x0000000000000001
-const REPN  =  0x0000000000000010
-const REP =    0x0000000000000100
-const CS =     0x0000000000001000
-const SS =     0x0000000000010000
-const DS =     0x0000000000100000
-const ES =     0x0000000001000000
-const FS =     0x0000000010000000
-const GS =     0x0000000100000000
-const OP_SZO = 0x0000001000000000
-const AD_SZO = 0x0000010000000000
-
-const BR_NTAKEN = CS
-const BR_TAKEN = DS
-const BOUNDS = REPN
-=#
 module X
-const regnames = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
-                  "8", "9", "10", "11", "12", "13", "14", "15"]
+const regnames = ["ra", "rc", "rd", "rb", "sp", "bp", "si", "di",
+                  "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
 reg_name(n) = regnames[n+1]
 rex_w(rex) = (rex & 0x8) >> 3
 rex_r(rex) = (rex & 0x4) >> 2
@@ -64,13 +23,21 @@ const S_b = 0x2
 const S_z = 0x3
 const S_p = 0x4
 const S_w = 0x5
-const F_NO_MODRM = 0x1
+const F_NEEDS_MODRM = 0x1
 const F_MODRM_EXT = 0x2
+const F_GENERIC = 0x4
 immutable OpDesc
     op
     sz
 end
+function needs_modrm(op::OpDesc)
+    op.op in (OP_E, OP_G, OP_M)#, OP_R)
+end
+function needs_imm(op::OpDesc)
+    op.op in (OP_I, OP_J)
+end
 OpDesc() = OpDesc(OP_NO, 0x0)
+isvalid(op::OpDesc) = op.op != OP_NO
 function OpDesc(spec::ASCIIString)
     op = 0x0
     if length(spec) == 0
@@ -137,106 +104,197 @@ function OpDesc(spec::ASCIIString)
     end
     OpDesc(op, sz)
 end
-immutable InsnDesc
-    name
+
+immutable InsnDesc3AC
+    name :: ASCIIString
     dst :: OpDesc
     src1 :: OpDesc
     src2 :: OpDesc
     flags :: UInt
 end
-#InsnDesc(name, dst::Tuple, src1::Tuple, src2::Tuple, rest...) = InsnDesc(name, OpDesc(dst...), OpDesc(src1...), OpDesc(src2...), rest...)
-InsnDesc(name, d, s1, s2) = InsnDesc(name, d, s1, s2, 0)
-InsnDesc(name, d :: ASCIIString, s1 :: ASCIIString, s2 :: ASCIIString, flags) = InsnDesc(name, OpDesc(d), OpDesc(s1), OpDesc(s2), flags)
-const op1_table = Dict{UInt8,InsnDesc}()
-const op2_table = Dict{UInt8,InsnDesc}()
-const modrm_ext_table = Dict{UInt8,Vector{InsnDesc}}()
+dest_ops(i :: InsnDesc3AC) = (i.dst,)
+src_ops(i :: InsnDesc3AC) = (i.src1, i.src2)
+immutable InsnDescGen
+    name :: ASCIIString
+    dsts :: Vector{OpDesc}
+    srcs :: Vector{OpDesc}
+    flags :: UInt
+end
+dest_ops(i :: InsnDescGen) = i.dsts
+src_ops(i :: InsnDescGen) = i.srcs
+
+immutable InsnTable
+    insn_3ac :: Vector{InsnDesc3AC}
+    insn_gen :: Dict{UInt8, InsnDescGen}
+end
+function InsnTable(sz :: Int)
+    tab_3ac = Array(InsnDesc3AC, sz)
+    InsnTable(tab_3ac, Dict{UInt8, InsnDescGen}())
+end
+function Base.getindex(t::InsnTable, i)
+    i3ac = t.insn_3ac[i+1]
+    if i3ac.flags & F_GENERIC != 0
+        t.insn_gen[i]
+    else
+        i3ac
+    end
+end
+function needs_modrm(d :: InsnDesc3AC)
+    needs_modrm(d.dst) | needs_modrm(d.src1) | needs_modrm(d.src2) |
+    ((d.flags&F_MODRM_EXT) != 0) | ((d.flags&F_NEEDS_MODRM) != 0)
+end
+function needs_imm(d :: InsnDesc3AC)
+    needs_imm(d.dst) | needs_imm(d.src1) | needs_imm(d.src2)
+end
+function imm_sz(d :: OpDesc)
+    if needs_imm(d)
+        d.sz
+    else
+        0
+    end
+end
+function needs_modrm(d :: InsnDescGen)
+    reduce(|, map(needs_modrm, d.dsts)) | reduce(|, map(needs_modrm, d.srcs)) | 
+    ((d.flags&F_MODRM_EXT) != 0) | ((d.flags&F_NEEDS_MODRM) != 0)
+end
+function needs_imm(d :: InsnDescGen)
+    reduce(|, map(needs_imm, d.dsts)) |
+    reduce(|, map(needs_imm, d.srcs))
+end
+imm_sz(d :: InsnDesc3AC) = max(imm_sz(d.src1), imm_sz(d.src2), imm_sz(d.dst))
+imm_sz(d :: InsnDescGen) = max(maximum(map(imm_sz, d.dsts)),
+                               maximum(map(imm_sz, d.srcs)))
+const op1_tab = InsnTable(256)
+const op2_tab = InsnTable(256)
+const modrm_ext_tab = Dict{UInt8,InsnTable}()
+# OP_DS_S
+# OP_D_S_S
+# OP_D
+# OP_S
+function op_2ac!(tab, opc, name, dst_src1, src2, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(dst_src1), OpDesc(dst_src1), OpDesc(src2), flags)
+end
+function op_d_s!(tab, opc, name, dst, src, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(dst), OpDesc(src), OpDesc(), flags)
+end
+function op_s!(tab, opc, name, src, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(), OpDesc(src), OpDesc(), flags)
+end
+function op_2s!(tab, opc, name, src1, src2, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(), OpDesc(src1), OpDesc(src2), flags)
+end
+function op_3ac!(tab, opc, name, dst, src1, src2, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(dst), OpDesc(src1), OpDesc(src2), flags)
+end
+function op_0!(tab, opc, name, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(), OpDesc(), OpDesc(), flags)
+end
+function op_gen!(tab, opc, name, dsts, srcs, flags = 0)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(), OpDesc(), OpDesc(), F_GENERIC)
+    tab.insn_gen[opc] = InsnDescGen(name, collect(map(OpDesc, dsts)), collect(map(OpDesc, srcs)), flags)
+end
+function ext_group!(tab, ext_tab, sz, opc, name)
+    tab.insn_3ac[opc+1] = InsnDesc3AC(name, OpDesc(), OpDesc(), OpDesc(), F_MODRM_EXT)
+    ext_tab[opc] = InsnTable(8)
+end
+ext_op_3ac!(tab, opc1, opc2, args...) = op_3ac!(tab[opc1], opc2, args...)
+ext_op_2ac!(tab, opc1, opc2, args...) = op_2ac!(tab[opc1], opc2, args...)
+ext_op_d_s!(tab, opc1, opc2, args...) = op_d_s!(tab[opc1], opc2, args...)
+ext_op_s!(tab, opc1, opc2, args...) = op_s!(tab[opc1], opc2, args...)
 # "standard" instructions
 for (bop, name) in [(0x00, "add"), (0x10, "adc"), (0x20, "and"), (0x30, "xor"),
                     (0x08, "or"),  (0x18, "sbb"), (0x28, "sub"), (0x38, "cmp")]
-    op1_table[bop] = InsnDesc(name, "Eb", "Eb", "Gb")
-    op1_table[bop+1] = InsnDesc(name, "Ev", "Ev", "Gv")
-    op1_table[bop+2] = InsnDesc(name, "Gb", "Gb", "Eb")
-    op1_table[bop+3] = InsnDesc(name, "Gv", "Gv", "Ev")
-    op1_table[bop+4] = InsnDesc(name, "CR0b", "CR0b", "Ib", F_NO_MODRM)
-    op1_table[bop+5] = InsnDesc(name, "CR0v", "CR0v", "Iz", F_NO_MODRM)
+    op_2ac!(op1_tab, bop+0, name, "Eb", "Gb")
+    op_2ac!(op1_tab, bop+1, name, "Ev", "Gv")
+    op_2ac!(op1_tab, bop+2, name, "Gb", "Eb")
+    op_2ac!(op1_tab, bop+3, name, "Gv", "Ev")
+    op_2ac!(op1_tab, bop+4, name, "CR0b", "Ib")
+    op_2ac!(op1_tab, bop+5, name, "CR0v", "Iz")
 end
-op1_table[0x88] = InsnDesc("mov", "Eb", "", "Gb")
-op1_table[0x89] = InsnDesc("mov", "Ev", "", "Gv")
-op1_table[0x8a] = InsnDesc("mov", "Gb", "", "Eb")
-op1_table[0x8b] = InsnDesc("mov", "Gv", "", "Ev")
-#TODO mov 0x8c
-op1_table[0x8d] = InsnDesc("lea", "Gv", "Gv", "M")
+op_d_s!(op1_tab, 0x88, "mov", "Eb", "Gb")
+op_d_s!(op1_tab, 0x89, "mov", "Ev", "Gv")
+op_d_s!(op1_tab, 0x8a, "mov", "Gb", "Eb")
+op_d_s!(op1_tab, 0x8b, "mov", "Gv", "Ev")
+# TODO 8c
+op_2ac!(op1_tab, 0x8d, "lea", "Gv", "M")
+
 # jumps
 for (i, name) in enumerate(["jo", "jno", "jb", "jnb", "jz", "jnz", "jbe", "jnbe",
                             "js", "jns", "jp", "jnp", "jl", "jnl", "jle", "jnle"])
-    op1_table[0x70 + i - 1] = InsnDesc(name, "", "", "Jb", F_NO_MODRM)
+    op_s!(op1_tab, 0x70+i-1, name, "Jb")
+    op_s!(op2_tab, 0x80+i-1, name, "Jz")
 end
 # instruction with inline reg
 for (opc,name,args) in [(0x50, "push", ("", "Tv", "")),
                         (0x58, "pop", ("Tv", "", "")),
-                        (0x90, "xchg", ("", "Tv", "CR0v")),
                         (0xb0, "mov", ("Tb", "", "Ib")),
                         (0xb8, "mov", ("Tv", "", "Iv"))]
     for act_opc = opc:opc+7
-        op1_table[act_opc] = InsnDesc(name, args..., F_NO_MODRM)
+        op_3ac!(op1_tab, act_opc, name, args...)
     end
 end
-op1_table[0xe8] = InsnDesc("call", "", "", "Jz", F_NO_MODRM)
-op1_table[0xe9] = InsnDesc("jmp", "", "", "Jz", F_NO_MODRM)
-#op1_table[0xea] = InsnDesc("jmp", "", "", "Ap", F_NO_MODRM)
-op1_table[0xeb] = InsnDesc("jmp", "", "", "Jb", F_NO_MODRM)
-op1_table[0xf4] = InsnDesc("hlt", "", "", "", F_NO_MODRM)
-op1_table[0xc2] = InsnDesc("ret", "", "", "Iw", F_NO_MODRM)
-op1_table[0xc3] = InsnDesc("ret", "", "", "", F_NO_MODRM)
-for (opc, name) in [(0x84, "test"), (0x86, "xchg")] # TODO support multiple output for xchg
-    op1_table[opc] = InsnDesc(name, "", "Eb", "Gb")
-    op1_table[opc+1] = InsnDesc(name, "", "Ev", "Gv")
+for act_opc = 0x90:0x90+7
+    op_gen!(op1_tab, act_opc, "xchg", ("Tv", "CR0v"), ("Tv", "CR0v"))
 end
+op_s!(op1_tab, 0xe8, "call", "Jz")
+op_s!(op1_tab, 0xe9, "jmp", "Jz")
+#op_s!(op1_tab, 0xea, "jmp", "Ap")
+op_s!(op1_tab, 0xeb, "jmp", "Jb")
+op_0!(op1_tab, 0xf4, "hlt")
+op_s!(op1_tab, 0xc2, "ret", "Iw")
+op_0!(op1_tab, 0xc3, "ret")
+
+for (opc, name) in [(0x84, "test"),]
+    op_2s!(op1_tab, opc+0, name, "Eb", "Gb")
+    op_2s!(op1_tab, opc+1, name, "Ev", "Gv")
+end
+op_gen!(op1_tab, 0x86, "xchg", ("Eb", "Gb"), ("Eb", "Gb"))
+op_gen!(op1_tab, 0x86, "xchg", ("Ev", "Gv"), ("Ev", "Gv"))
 
 # group 1
 for i = 0:3
     opc = 0x80 + i
-    modrm_ext_table[opc] = Array(InsnDesc, 8)
-    op1_table[opc] = InsnDesc("group1", "", "", "", F_MODRM_EXT)
+    ext_group!(op1_tab, modrm_ext_tab, 8, opc, "group1")
 end
 for (j, name) in enumerate(["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"])
     o1 = name == "cmp" ? "" : "Eb"
     o2 = name == "cmp" ? "" : "Ev"
-    modrm_ext_table[0x80][j] = InsnDesc(name, o1, "Eb", "Ib")
-    modrm_ext_table[0x81][j] = InsnDesc(name, o2, "Ev", "Iz")
-    modrm_ext_table[0x82][j] = InsnDesc(name, o1, "Eb", "Ib")
-    modrm_ext_table[0x83][j] = InsnDesc(name, o2, "Ev", "Ib")
+    j = j-1
+    ext_op_3ac!(modrm_ext_tab, 0x80, j, name, o1, "Eb", "Ib")
+    ext_op_3ac!(modrm_ext_tab, 0x81, j, name, o2, "Ev", "Iz")
+    #ext_op_3ac!(modrm_ext_tab, 0x82, j, name, o1, "Eb", "Ib") # TODO invalid
+    ext_op_3ac!(modrm_ext_tab, 0x83, j, name, o2, "Ev", "Ib")
 end
 # group 2
 for i in (0xc0, 0xc1, 0xd0, 0xd1, 0xd2, 0xd3)
-    modrm_ext_table[i] = Array(InsnDesc, 8)
-    op1_table[i] = InsnDesc("group2", "", "", "", F_MODRM_EXT)
+    ext_group!(op1_tab, modrm_ext_tab, 8, i, "group2")
 end
 for (j, name) in enumerate(["rol", "ror", "rcl", "rcr", "shl", "shr", "shl", "sar"])
-    modrm_ext_table[0xc0][j] = InsnDesc(name, "Eb", "Eb", "Ib")
-    modrm_ext_table[0xc1][j] = InsnDesc(name, "Ev", "Ev", "Ib")
-    modrm_ext_table[0xd0][j] = InsnDesc(name, "Eb", "Eb", "CV1b")
-    modrm_ext_table[0xd1][j] = InsnDesc(name, "Ev", "Ev", "CV1b")
-    modrm_ext_table[0xd2][j] = InsnDesc(name, "Eb", "Eb", "CR1b")
-    modrm_ext_table[0xd3][j] = InsnDesc(name, "Ev", "Ev", "CR1b")
+    j = j-1
+    ext_op_2ac!(modrm_ext_tab,0xc0,j,name, "Eb", "Ib")
+    ext_op_2ac!(modrm_ext_tab,0xc1,j,name, "Ev", "Ib")
+    ext_op_2ac!(modrm_ext_tab,0xd0,j,name, "Eb", "CV1b")
+    ext_op_2ac!(modrm_ext_tab,0xd1,j,name, "Ev", "CV1b")
+    ext_op_2ac!(modrm_ext_tab,0xd2,j,name, "Eb", "CR1b")
+    ext_op_2ac!(modrm_ext_tab,0xd3,j,name, "Ev", "CR1b")
 end
 # group 5
-op1_table[0xff] = InsnDesc("group5", "", "", "", F_MODRM_EXT)
-modrm_ext_table[0xff] = Array(InsnDesc, 7)
+ext_group!(op1_tab, modrm_ext_tab, 7, 0xff, "group5")
 for (opc, name, dst) in [(0,"inc", "Ev"), (1, "dec", "Ev"), (6, "push", "")]
-    modrm_ext_table[0xff][opc+1] = InsnDesc(name, dst, "Ev", "")
+    ext_op_d_s!(modrm_ext_tab,0xff,opc,name,dst, "Ev")
 end
 for (opc, name) in [(2,"call"), (4, "jmp")]
-    modrm_ext_table[0xff][opc+1] = InsnDesc(name, "", "Ev", "")
-    modrm_ext_table[0xff][opc+2] = InsnDesc(name, "", "Ep", "")
+    ext_op_s!(modrm_ext_tab,0xff,opc,name,"Ev")
+    ext_op_s!(modrm_ext_tab,0xff,opc+1,name,"Ep")
 end
+
 # group 11
-op1_table[0xc6] = InsnDesc("mov", "Eb", "", "Ib")
-op1_table[0xc7] = InsnDesc("mov", "Ev", "", "Iz")
+op_d_s!(op1_tab, 0xc6, "mov", "Eb", "Ib")
+op_d_s!(op1_tab, 0xc7, "mov", "Ev", "Iz")
 
 # 2-byte opcodes
-    
-op2_table[0x1f] = InsnDesc("nop", "", "", "") # TODO prefetch is also in there in group 16
+
+op_0!(op2_tab, 0x1f, "nop", F_NEEDS_MODRM) # TODO prefetch is also in there in group 16
 
 immutable Reg
     n :: Int
@@ -247,7 +305,30 @@ end
 immutable IpRel
     v
 end
+immutable Load
+    base
+    index
+    scale
+    disp
+end
 Base.show(io::IO, r::Reg) = print(io, reg_name(r.n))
+Base.show(io::IO, r::Imm) = @printf(io, "imm(%#x)", r.v)
+Base.show(io::IO, r::IpRel) = @printf(io, "*(ip + %#x)", r.v)
+function Base.show(io::IO, r::Load)
+    if r.scale == 0
+        if r.disp == 0
+            @printf(io, "*(%s)", r.base)
+        else
+            @printf(io, "*(%s + %#x)", r.base, r.disp)
+        end
+    else
+        if r.disp == 0
+            @printf(io, "*(%s + %d*%s)", r.base, r.scale, r.index)
+        else
+            @printf(io, "*(%s + %d*%s + %#x)", r.base, r.scale, r.index, r.disp)
+        end
+    end
+end
 function S_to_typ(s, op_typ)
     if s == S_b
         UInt8
@@ -270,6 +351,7 @@ function go2(io :: IO)
     pfx3 = 0x0
     pfx4 = 0x0
     pfx_rex = 0x0
+    # read prefixes
     while true
         x = read(io, UInt8)
         if x in (0xf0, 0xf2, 0xf3)
@@ -280,7 +362,7 @@ function go2(io :: IO)
             pfx3 = x
         elseif x == 0x67
             pfx4 = x
-        elseif (x & 0xf0) == 0x40 # only in long mode
+        elseif (x & 0xf0) == 0x40 # TODO only in long mode
             pfx_rex = x
             break
         else
@@ -295,6 +377,7 @@ function go2(io :: IO)
     opcode1 = read(io, UInt8)
     @printf("opcode1 = %#x\n", opcode1)
 
+    # adjust operand & addr size
     op_typ = UInt32
     if has_rex(pfx_rex)
         if rex_w(pfx_rex) != 0
@@ -312,15 +395,15 @@ function go2(io :: IO)
     desc = if opcode1 == 0x0f
         opcode2 = read(io, UInt8)
         @printf("opcode2 = %#x\n", opcode2)
-        op2_table[opcode2]
+        op2_tab[opcode2]
     else
-        op1_table[opcode1]
+        op1_tab[opcode1]
     end
 
     # read mod/rm & sib
     reg = nothing
     rm = nothing
-    if (desc.flags & F_NO_MODRM) == 0
+    if needs_modrm(desc)
         modrm = read(io, UInt8)
         modrm_mod = (0xc0 & modrm) >> 6
         modrm_reg = (0x38 & modrm) >> 3
@@ -338,36 +421,55 @@ function go2(io :: IO)
         reg = Reg(modrm_reg_adj)
         rm = nothing
 
-        if modrm_rm == 0x4 && modrm_mod != 0x3
-            modrm_sib = read(io, UInt8)
-        end
-        if modrm_mod == 0x0
-            if modrm_rm == 0x5
-                disp = read(io, UInt32) # RIP relative addressing
-                rm = IpRel(disp)
-            else
-                rm = (:deref, Reg(modrm_rm_adj))
+
+        if modrm_mod != 0x3
+            if modrm_rm == 0x4 # SIB
+                modrm_sib = read(io, UInt8)
             end
-        elseif modrm_mod == 0x1
-            modrm_disp = UInt32(read(io, UInt8))
-            rm = (:disp, modrm_rm)
-        elseif modrm_mod == 0x2
-            modrm_disp = read(io, UInt32)
-            rm = (:disp, modrm_rm)
-        elseif modrm_mod == 0x3
+            if modrm_mod == 0x0
+                if modrm_rm == 0x5
+                    modrm_disp = read(io, UInt32) # RIP relative addressing
+                    rm = IpRel(disp)
+                end
+            elseif modrm_mod == 0x1
+                modrm_disp = UInt32(read(io, UInt8))
+            elseif modrm_mod == 0x2
+                modrm_disp = read(io, UInt32)
+            end
+            if modrm_rm == 0x4 # SIB
+                @show modrm_sib
+                sib_scale = (modrm_sib & 0xc0) >> 6
+                sib_index = (modrm_sib & 0x38) >> 3
+                sib_base = modrm_sib & 0x7
+                @show sib_scale sib_index sib_base
+                # b i s d
+                if has_rex(pfx_rex)
+                    sib_base = sib_base | (rex_b(pfx_rex) << 3) # TODO sib_base == 5 special case
+                    sib_index = sib_index | (rex_x(pfx_rex) << 3)
+                end
+                load_scale = 1 << sib_scale
+                if sib_index == 0x4 # sp special case
+                    load_scale = 0
+                end
+                @show sib_scale sib_index sib_base
+                rm = Load(Reg(sib_base),Reg(sib_index),load_scale,modrm_disp)
+            else
+                rm = Load(Reg(modrm_rm_adj),0,0,modrm_disp)
+            end
+        else
             rm = Reg(modrm_rm_adj)
         end
     end
 
     if (desc.flags & F_MODRM_EXT) != 0
-        desc = modrm_ext_table[opcode1][modrm_reg + 1]
+        desc = modrm_ext_tab[opcode1][modrm_reg]
     end
 
 
     imm = nothing
     imm_typ = Void
-    if desc.src2.op in (OP_I, OP_J)
-        imm = read(io, S_to_typ(desc.src2.sz, op_typ))
+    if needs_imm(desc)
+        imm = read(io, S_to_typ(imm_sz(desc), op_typ))
     end 
     function read_operand(op)
         if op.op == OP_NO
@@ -395,12 +497,16 @@ function go2(io :: IO)
             error("unknown op $op")
         end
     end
-    dst = read_operand(desc.dst)
+    
+    d = map(read_operand, collect(filter(isvalid, dest_ops(desc))))
+    s = map(read_operand, collect(filter(isvalid, src_ops(desc))))
+    #=dst = read_operand(desc.dst)
     src1 = read_operand(desc.src1)
-    src2 = read_operand(desc.src2)
-
+    src2 = read_operand(desc.src2)=#
+    dest_s = isempty(d) ? "" : string(join(d, ", "), " <- ")
+    src_s = join(s, ", ")
     name = desc.name
-    print_with_color(:green, @sprintf("%s <- %s %s %s\n", dst, name, src1, src2))
+    print_with_color(:green, dest_s, name, " ", src_s, "\n")
 end
 
 function go(s::AbstractString, n = 5)
